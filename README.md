@@ -98,9 +98,10 @@ Notes:
   block is stripped, and an unfinished one counts as no answer.
 - OpenRouter requests send `provider.data_collection: "deny"` (`LLM_DATA_COLLECTION`) so client texts
   only go to providers that don't store or train on them.
-- Ollama's default context window is small and long prompts are cut off silently. The client sends
-  `LLM_NUM_CTX` (default 16384) and flags a result whose prompt filled the window. The `raw_json`
-  format for a busy group text can run past 10,000 tokens.
+- Ollama's default context window is 4096 tokens on GPUs under 24 GB, and by default it silently
+  mangles a prompt that doesn't fit. The client sends a fixed `LLM_NUM_CTX` (default 16384) with
+  `truncate`/`shift` off, so an over-long prompt shows up as an error in the report instead. The
+  `raw_json` format for a busy group text can run past 10,000 tokens.
 
 ## Tests
 

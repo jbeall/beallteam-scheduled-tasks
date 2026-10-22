@@ -138,10 +138,48 @@ Pabbly-owned subscription (omitted fields reset to defaults); dedupe in code ins
 Check before launch whether Dialpad's native Copper integration is enabled and logs SMS, so notes aren't
 duplicated.
 
+## LLM
+
+- One client, two backends (`src/llm_client.py`):
+  - **Ollama**, native `POST /api/chat` with `think: false`, `options.num_ctx` (fixed for the whole run;
+    changing it reloads the model), `truncate: false` and `shift: false` (otherwise a prompt longer than
+    the window keeps only its first few tokens and drops the rest, system prompt included, with no
+    error), `keep_alive: 10m`. Default context is 4096 tokens on GPUs under 24 GB.
+  - **OpenRouter**, `POST /api/v1/chat/completions` with `reasoning: {"effort": "none"}` (retried without
+    it for models whose reasoning is mandatory), `provider: {"data_collection": "deny"}`, and
+    `usage.cost` logged per call.
+- **Models.** Qwen3.8 (Aug 2026) has open weights only at 27B (`qwen3.8:27b`, ~18 GB at Q4, Apache-2.0 per
+  secondary reports) and a 2.4T MoE. Qwen3-8B (`qwen3:8b`, 2025) is a different, much smaller model.
+  OpenRouter: `qwen/qwen3.8-27b` (about $0.40 / $3.00 per million tokens in/out) or
+  `qwen/qwen3.8-flash` (about $0.15 / $0.47). Slugs and prices from secondary sources; confirm with
+  `GET /api/v1/models`. A night of ~20 conversations is a few thousand tokens: well under a cent.
+- Thinking is off by default; any `<think>` text is stripped and an unfinished one counts as no answer.
+- Qwen's card suggests temperature 0.7 / top_p 0.8 / top_k 20 for non-thinking mode; the default here is
+  0.2. Compare both with `sms-try-llm`.
+- Never write a note from an empty, cut-off or `NOTHING TO LOG` result.
+
+## Scheduling on the host
+
+- **Windows Task Scheduler:** action = the venv's `python.exe -m src sms-sync`, *Start in* = the repo root
+  (otherwise it runs in System32); daily ~3:30 AM (avoid 1-3 AM DST hours); "Run whether user is logged
+  on or not" with a stored password (S4U has no network access); Wake to run; Start when available (one
+  catch-up run after a missed night); allow on battery; time limit 2 h. Restart-on-failure may not fire on
+  a non-zero exit, so retries live in the job.
+- Ollama on Windows installs per user and starts at login. Run the task as that user, or run
+  `ollama serve` as a service with `OLLAMA_MODELS` pointing at the models; the job health-checks
+  `http://127.0.0.1:11434` first.
+- **Linux:** systemd oneshot service + timer, `OnCalendar=*-*-* 03:30:00 America/New_York`,
+  `Persistent=true`.
+- A multi-day outage produces one catch-up run, so the job processes every row still on `texts`, not
+  just "yesterday".
+
 ## Open questions
 
 - Is a person in several threads on one day one note (proposed) or one per thread?
 - Include the transcript under the summary in the Copper note, at least during the trial?
 - Log to Leads as well as People? Several records on one number: log to all, or skip and report?
 - Which team members text from numbers Dialpad does not know as users?
+- "Qwen 3.8": Qwen3.8-27B (needs a 24 GB GPU) or Qwen3-8B? What GPU does the host have?
+- Is Dialpad's native Copper integration on, and does it log SMS?
+- What does "BTGT" in group names mean (strip it from the model's input)?
 - Why were some rows logged without `target`/`members` (Pabbly task history for that window)?

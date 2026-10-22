@@ -40,6 +40,8 @@ def test_ollama_request_disables_thinking_and_sets_context() -> None:
     assert sent[0]["url"] == "http://ollama:11434/api/chat"
     assert body["think"] is False and body["stream"] is False and body["format"] == "json"
     assert body["options"]["num_ctx"] == 16384
+    assert body["truncate"] is False and body["shift"] is False
+    assert "top_p" not in body["options"]
     assert (result.text, result.prompt_tokens, result.completion_tokens, result.warning) == ("Note.", 40, 5, None)
 
 

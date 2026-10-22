@@ -38,6 +38,8 @@ class LlmConfig:
     model: str
     api_key: str = ""
     temperature: float = 0.2
+    top_p: float | None = None
+    top_k: int | None = None
     max_tokens: int = 800
     num_ctx: int = 16384  # Ollama context window; its small default silently truncates long prompts
     think: bool = False  # Qwen3-family models "think" before answering unless told not to
@@ -66,6 +68,8 @@ class LlmConfig:
             model=model,
             api_key=api_key,
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
+            top_p=float(os.getenv("LLM_TOP_P")) if os.getenv("LLM_TOP_P", "").strip() else None,
+            top_k=int(os.getenv("LLM_TOP_K")) if os.getenv("LLM_TOP_K", "").strip() else None,
             max_tokens=int(os.getenv("LLM_MAX_TOKENS", "800")),
             num_ctx=int(os.getenv("LLM_NUM_CTX", "16384")),
             think=os.getenv("LLM_THINK", "false").strip().lower() in {"1", "true", "yes"},
@@ -148,19 +152,28 @@ class LlmClient:
 
     def _ollama(self, messages: list[dict[str, str]], json_output: bool) -> LlmResult:
         # Native /api/chat, because the OpenAI-compatible endpoint can't set num_ctx. num_ctx stays
-        # fixed across calls: changing it makes Ollama reload the model.
+        # fixed across calls: changing it makes Ollama reload the model. truncate/shift off make an
+        # over-long prompt fail with an error; otherwise Ollama keeps only its first few tokens and
+        # drops the rest (system prompt included) without saying so.
         cfg = self.config
+        options: dict[str, Any] = {
+            "num_ctx": cfg.num_ctx,
+            "temperature": cfg.temperature,
+            "num_predict": cfg.max_tokens,
+        }
+        if cfg.top_p is not None:
+            options["top_p"] = cfg.top_p
+        if cfg.top_k is not None:
+            options["top_k"] = cfg.top_k
         body: dict[str, Any] = {
             "model": cfg.model,
             "messages": messages,
             "stream": False,
             "think": cfg.think,
             "keep_alive": "10m",
-            "options": {
-                "num_ctx": cfg.num_ctx,
-                "temperature": cfg.temperature,
-                "num_predict": cfg.max_tokens,
-            },
+            "truncate": False,
+            "shift": False,
+            "options": options,
         }
         if json_output:
             body["format"] = "json"
@@ -202,6 +215,10 @@ class LlmClient:
             "temperature": cfg.temperature,
             "max_tokens": cfg.max_tokens,
         }
+        if cfg.top_p is not None:
+            body["top_p"] = cfg.top_p
+        if cfg.top_k is not None:
+            body["top_k"] = cfg.top_k
         if json_output:
             body["response_format"] = {"type": "json_object"}
         if cfg.provider == "openrouter":
