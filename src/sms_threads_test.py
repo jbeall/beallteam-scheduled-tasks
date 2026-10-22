@@ -97,7 +97,7 @@ def test_extra_team_numbers_are_not_contacts() -> None:
 def test_classify_reactions_photos_and_text() -> None:
     assert classify("Liked “Okay, we have one buyer”", False) == ("reaction", "Okay, we have one buyer", "👍")
     assert classify("Laughed at “plant trees 😉”", False) == ("reaction", "plant trees 😉", "😂")
-    ios = " ​👍​ a “ Waiting on signatures ” "
+    ios = "\u200a\u200b👍\u200b a “\u200aWaiting on signatures\u200a”\u200a"
     assert classify(ios, False) == ("reaction", "Waiting on signatures", "👍")
     assert classify("❤️ a “See you Wed”", False) == ("reaction", "See you Wed", "❤️")
     assert classify("🤗🤗For the cottage or the main house?", False) == ("text", "🤗🤗For the cottage or the main house?", None)
@@ -124,4 +124,59 @@ def test_conversation_days_use_eastern_dates() -> None:
         (date(2026, 10, 21), ["late text"]),
         (date(2026, 10, 22), ["morning text"]),
     ]
-    assert days[0].slug == "2026-10-21_pat-client"
+    assert days[0].slug == "2026-10-21_pat-client_0001"
+
+
+def test_international_numbers_keep_their_country_code() -> None:
+    assert phones.normalize("+4791234567") == "+4791234567"
+    assert phones.normalize("+6591234567") == "+6591234567"
+    assert phones.normalize("5550102111") == "+15550102111"
+
+
+def test_client_texting_two_team_lines_is_one_thread() -> None:
+    first = direct(80, "2026-10-21T15:00:00", "Is the house still available?")
+    second = direct(81, "2026-10-21T15:05:00", "Following up", target=AGENT_2)
+    [thread] = build_threads(_events(first, second))
+    assert [p.name for p in thread.team] == ["Alex Agent", "Robin Agent"]
+    assert [p.name for p in thread.contacts] == ["Pat Client"]
+
+
+def test_names_come_from_the_whole_batch_when_a_thread_only_has_slim_rows() -> None:
+    named = direct(90, "2026-10-21T15:00:00", "Hi", contact=CLIENT_2)
+    slim = direct(91, "2026-10-21T16:00:00", "Payment is $2,203.95")
+    for key in ("target", "sender_id", "mms", "is_internal", "message_status", "text_content", "mms_url"):
+        slim.pop(key)
+    threads = build_threads(_events(named, slim))
+    pat = next(t for t in threads if t.title == "Pat Client")
+    assert [p.name for p in pat.team] == ["Alex Agent"]
+
+
+def test_same_display_name_gets_the_number_added() -> None:
+    own_cell = {"name": "Alex Agent", "phone": "+15550000009"}
+    event = direct(95, "2026-10-21T15:00:00", "test", direction="outbound", contact=own_cell)
+    [thread] = build_threads(_events(event), team_numbers=["+15550000009"])
+    assert sorted(p.name for p in thread.team) == ["Alex Agent (555) 000-0001", "Alex Agent (555) 000-0009"]
+
+
+def test_internal_text_marks_the_other_side_as_team() -> None:
+    to_teammate = direct(96, "2026-10-21T15:00:00", "Can you cover my showing?", direction="outbound",
+                         contact={"name": "Robin Agent", "phone": "+15550000002"})
+    to_teammate["is_internal"] = True
+    [thread] = build_threads(_events(to_teammate))
+    assert thread.skip_reason == "team members only"
+
+
+def test_mms_caption_comes_from_text_content() -> None:
+    url = "https://content.dialpad.com/s/img/abc=s0"
+    photo = direct(97, "2026-10-21T15:00:00", url, mms=True)
+    photo["text_content"] = "Water stain on the ceiling - is that a problem?"
+    [thread] = build_threads(_events(photo))
+    message = thread.messages[0]
+    assert (message.kind, message.text) == ("photo", "Water stain on the ceiling - is that a problem?")
+
+
+def test_more_reaction_forms() -> None:
+    assert classify("Removed a like from “Okay, we have one buyer”", False) == ("reaction", "Okay, we have one buyer", "removed")
+    assert classify("Loved an image", False) == ("reaction", "an image", "❤️")
+    assert classify("Reacted 😮 to “That was fast”", False) == ("reaction", "That was fast", "😮")
+    assert classify('Reacted badly to "the appraisal"', False) == ("text", 'Reacted badly to "the appraisal"', None)

@@ -7,12 +7,14 @@ import re
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from typing import TextIO
 
 from src.llm_client import LlmClient, LlmConfig, LlmError
 from src.paths import LLM_RUNS_DIR
 from src.commands.sms_formats import load_days
-from src.sms_formats import FORMAT_NAMES, focus_person, render
-from src.sms_prompts import PROMPT_NAMES, build_messages
+from src.sms_formats import FORMAT_NAMES, render, sent_messages
+from src.sms_prompts import PROMPT_NAMES, build_messages, is_nothing_to_log
+from src.sms_threads import ConversationDay
 
 _SLUG = re.compile(r"[^a-zA-Z0-9.]+")
 
@@ -26,11 +28,14 @@ def _summary_table(records: list[dict]) -> list[str]:
     for record in records:
         totals[(record["format"], record["prompt"])].append(record)
     lines = [
-        "| Format | Prompt | Runs | Errors | Avg prompt tokens | Avg output tokens | Avg seconds | Total cost |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Format | Prompt | Runs | Errors | Empty | Nothing to log | Warnings | Avg prompt tokens | Avg output tokens | Avg seconds | Total cost |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for (format_name, prompt_name), group in totals.items():
-        ok = [r for r in group if not r.get("error")]
+        ok = [r for r in group if "error" not in r]
+        empty = sum(1 for r in ok if not r.get("output"))
+        warned = sum(1 for r in ok if r.get("warning"))
+        skipped = sum(1 for r in ok if r.get("nothing_to_log"))
 
         def avg(key: str) -> str:
             values = [r[key] for r in ok if r.get(key) is not None]
@@ -38,7 +43,7 @@ def _summary_table(records: list[dict]) -> list[str]:
 
         costs = [r["cost_usd"] for r in ok if r.get("cost_usd") is not None]
         lines.append(
-            f"| {format_name} | {prompt_name} | {len(group)} | {len(group) - len(ok)} | "
+            f"| {format_name} | {prompt_name} | {len(group)} | {len(group) - len(ok)} | {empty} | {skipped} | {warned} | "
             f"{avg('prompt_tokens')} | {avg('completion_tokens')} | {avg('seconds')} | "
             f"{'$%.4f' % sum(costs) if costs else '-'} |"
         )
@@ -82,74 +87,104 @@ def run(
         suffix += 1
         run_dir = LLM_RUNS_DIR / f"{stem}-{suffix}"
     run_dir.mkdir(parents=True)
-    jsonl = (run_dir / "results.jsonl").open("w", encoding="utf-8")
     calls = len(days) * len(formats) * len(prompts)
     print(f"{config.provider} {config.model}: {len(days)} conversation-days x {len(formats)} formats x {len(prompts)} prompts = {calls} calls")
 
     records: list[dict] = []
     sections: list[str] = []
-    with LlmClient(config) as client:
-        for day in days:
-            person = focus_person(day)
-            sections += [
-                "",
-                f"## {day.day} - {day.thread.title} ({len(day.messages)} messages)",
-                "",
-                "<details><summary>Conversation (transcript format)</summary>",
-                "",
-                "```text",
-                render("transcript", day),
-                "```",
-                "",
-                "</details>",
-            ]
-            for format_name in formats:
-                conversation = render(format_name, day, person)
-                for prompt_name in prompts:
-                    focus = person.name if format_name == "person_focus" else None
-                    messages = build_messages(prompt_name, format_name, conversation, person_name=focus)
-                    record = {
-                        "day": day.slug,
-                        "format": format_name,
-                        "prompt": prompt_name,
-                        "person": focus,
-                        "model": config.model,
-                        "provider": config.provider,
-                    }
-                    try:
-                        result = client.chat(messages, json_output=prompt_name == "json")
-                        record.update(
-                            output=result.text,
-                            seconds=round(result.seconds, 2),
-                            prompt_tokens=result.prompt_tokens,
-                            completion_tokens=result.completion_tokens,
-                            cost_usd=result.cost_usd,
-                            thinking_chars=result.thinking_chars,
-                            warning=result.warning,
-                        )
-                        status = f"{result.seconds:.1f}s {result.prompt_tokens}+{result.completion_tokens} tok"
-                    except LlmError as exc:
-                        record["error"] = str(exc)
-                        status = f"ERROR {exc}"[:200]
-                    records.append(record)
-                    jsonl.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    jsonl.flush()
-                    print(f"  {day.slug} {format_name}/{prompt_name}: {status}")
+    try:
+        with LlmClient(config) as client, (run_dir / "results.jsonl").open("w", encoding="utf-8") as jsonl:
+            _run_calls(client, config, days, formats, prompts, records, sections, jsonl)
+    finally:
+        _write_report(run_dir, config, records, sections)
+    return 0
 
-                    meta = [f"{record.get('prompt_tokens') or '?'} prompt tok", f"{record.get('seconds', '?')}s"]
-                    if record.get("warning"):
-                        meta.append(f"WARNING: {record['warning']}")
-                    if record.get("thinking_chars"):
-                        meta.append(f"{record['thinking_chars']} chars of thinking stripped")
-                    label = f"{format_name} / {prompt_name}" + (f" (for {focus})" if focus else "")
-                    sections += [
-                        "",
-                        f"### {label} - {', '.join(meta)}",
-                        "",
-                        _quote(record.get("output") or f"ERROR: {record.get('error')}"),
-                    ]
-    jsonl.close()
 
+def _run_calls(
+    client: LlmClient,
+    config: LlmConfig,
+    days: list[ConversationDay],
+    formats: list[str],
+    prompts: list[str],
+    records: list[dict],
+    sections: list[str],
+    jsonl: TextIO,
+) -> None:
+    for day in days:
+        sections += [
+            "",
+            f"## {day.day} - {day.thread.title} ({len(day.messages)} messages)",
+            "",
+            "<details><summary>Conversation (transcript format)</summary>",
+            "",
+            "```text",
+            render("transcript", day),
+            "```",
+            "",
+            "</details>",
+        ]
+        # person_focus is one call per contact (that is what per-person notes would cost);
+        # every other format is one call per conversation-day.
+        jobs = [
+            (format_name, person)
+            for format_name in formats
+            for person in (day.thread.contacts if format_name == "person_focus" else [None])
+        ]
+        for format_name, person in jobs:
+            conversation = render(format_name, day, person)
+            for prompt_name in prompts:
+                focus = person.name if person else None
+                silent = bool(person and day.thread.is_group and not sent_messages(day, person))
+                messages = build_messages(
+                    prompt_name, format_name, conversation, person_name=focus, person_silent=silent
+                )
+                record = {
+                    "day": day.slug,
+                    "format": format_name,
+                    "prompt": prompt_name,
+                    "person": focus,
+                    "person_silent": silent,
+                    "model": config.model,
+                    "provider": config.provider,
+                }
+                try:
+                    result = client.chat(messages, json_output=prompt_name == "json")
+                    record.update(
+                        output=result.text,
+                        seconds=round(result.seconds, 2),
+                        prompt_tokens=result.prompt_tokens,
+                        completion_tokens=result.completion_tokens,
+                        cost_usd=result.cost_usd,
+                        thinking_chars=result.thinking_chars,
+                        warning=result.warning,
+                        nothing_to_log=is_nothing_to_log(result.text),
+                    )
+                    status = f"{result.seconds:.1f}s {result.prompt_tokens}+{result.completion_tokens} tok"
+                except LlmError as exc:
+                    record["error"] = str(exc)
+                    status = f"ERROR {exc}"[:200]
+                records.append(record)
+                jsonl.write(json.dumps(record, ensure_ascii=False) + "\n")
+                jsonl.flush()
+                who = f" [{focus}]" if focus else ""
+                print(f"  {day.slug} {format_name}/{prompt_name}{who}: {status}")
+
+                meta = [f"{record.get('prompt_tokens') or '?'} prompt tok", f"{record.get('seconds', '?')}s"]
+                if record.get("warning"):
+                    meta.append(f"WARNING: {record['warning']}")
+                if record.get("thinking_chars"):
+                    meta.append(f"{record['thinking_chars']} chars of thinking stripped")
+                label = f"{format_name} / {prompt_name}" + (
+                    f" (for {focus}{', sent nothing today' if silent else ''})" if focus else ""
+                )
+                if "error" in record:
+                    shown = f"ERROR: {record['error']}"
+                else:
+                    shown = record.get("output") or "(empty output)"
+                sections += ["", f"### {label} - {', '.join(meta)}", "", _quote(shown)]
+
+
+def _write_report(run_dir: Path, config: LlmConfig, records: list[dict], sections: list[str]) -> None:
     report = [
         f"# LLM summary comparison: {config.model}",
         "",
@@ -161,4 +196,3 @@ def run(
     ]
     (run_dir / "results.md").write_text("\n".join(report) + "\n", encoding="utf-8")
     print(f"Wrote {run_dir / 'results.md'}")
-    return 0

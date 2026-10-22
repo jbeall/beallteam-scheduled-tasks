@@ -26,10 +26,15 @@ The spreadsheet's own time zone is GMT; nothing depends on it.
   `RequestHeaders`). Cause unknown, probably on the Pabbly side. The team line comes from `to_number`
   (inbound) or `from_number` (outbound); group members are backfilled from other rows of the same
   `contact.id`.
-- **Groups.** `contact.type == "contact_group"`, `contact.id` is a stable thread id, `contact.members[]`
-  lists everyone except the target user. Members with `type: "user"` are Dialpad users (team).
-  `from_number` is always the real sender.
-- **MMS.** `text` is a `https://content.dialpad.com/s/img/...` URL and `text_content` is empty.
+- **Groups.** `contact.type == "contact_group"`, `contact.id` is a stable thread id (the same on every
+  Dialpad user's copy), `contact.members[]` lists everyone except the target user. Members with
+  `type: "user"` are Dialpad users (team). `from_number` is always the real sender; `sender_id` is null
+  for about a third of inbound group messages (members of type `mobile`), so it is not used.
+- **Status order.** The four status events of one message arrive in no fixed order (`delivered` was always
+  last in the sample). Nothing here depends on status; if failed sends are ever flagged, pick the status
+  by precedence (delivered/failed/undelivered > sent > pending/unknown), not by arrival.
+- **MMS.** `text` is a `https://content.dialpad.com/s/img/...` URL and `text_content` is empty (a caption,
+  if any, would be in `text_content`). Whether the image URL needs auth is unknown; test with `curl -I`.
 - **Reactions.** iMessage fallbacks: `Liked “…”`, `Laughed at “…”`, and `👍 a “…”` wrapped in hair /
   zero-width spaces. Rendered as `[reacted 👍 to “…”]` or dropped.
 - **Noise.** Shortcodes (5-6 digit senders), marketing texts, delivery reminders. Shortcodes are skipped;
@@ -41,18 +46,31 @@ The spreadsheet's own time zone is GMT; nothing depends on it.
 ## Processing model
 
 1. Read `texts` rows; parse; collect parse errors without stopping.
-2. Dedupe and group into threads: group threads by `contact.id`, 1:1 threads by (team line, contact number).
+2. Dedupe and group into threads: group threads by `contact.id`, 1:1 threads by the contact's number (a
+   client who texts two team lines is one conversation). Names come from the thread first, then from
+   every event in the batch.
 3. Split each thread into **conversation-days** by Eastern calendar date. Only process days before
    today (Eastern) so every day is complete; today's rows stay for tomorrow's run.
 4. Team numbers: every Dialpad line in the data, `type: "user"` group members, `TEAM_PHONE_NUMBERS`
    in `.env`, later `GET /api/v2/users` (`phone_numbers`, `forwarding_numbers`) and `GET /api/v2/numbers`.
 5. Match every non-team participant to Copper (below). Conversation-days with no match are not sent
    to the LLM; their numbers go in the run report.
-6. One LLM call per matched conversation-day (the summary is shared by everyone in the thread).
+6. One LLM call per matched conversation-day (the summary is shared by everyone in the thread). The
+   input names the weekday and the next 7 dates, lists contacts who sent nothing that day, decodes
+   RealScout links to addresses, and shows the last 5 messages before that day as context only (in
+   production, read from the `processed` tab).
 7. One Copper activity per person per Eastern day. A person in two threads that day gets one note with
    a section per thread. Group members who did not speak still get the note.
 8. Record each write in a local SQLite ledger; move handled rows from `texts` to `processed`; append a
    run summary row to a log tab.
+
+### Known limits
+
+- A group thread whose only rows that night are slim has no member list, so silent members can't be
+  found. Fix in the sync step: cache group `contact.id` -> members from earlier runs (the Dialpad API can't
+  fetch groups).
+- A conversation that crosses midnight Eastern becomes two days, so two notes. Accepted for v1; the second
+  day's input shows the first day's last messages as context.
 
 ## Copper
 
@@ -72,16 +90,28 @@ The spreadsheet's own time zone is GMT; nothing depends on it.
   et_date) -> activity_id`; before creating, `POST /activities/search` with parent, type and the day's
   window (ignore `is_deleted` stubs); update with `PUT /activities/{id}` instead of duplicating; a
   marker line in `details`.
-- **Limits.** 180 requests/minute rolling. Newline rendering and max length of `details` are not
-  documented; test a multi-line note before settling the layout.
+- **Formatting.** Notes are Markdown-backed: use blank lines between paragraphs, and escape `*`, `_`, `#`,
+  `>` and leading `-` in quoted SMS text. Max length is undocumented; test a multi-line note first.
+- **Interactions.** "Count as interaction" is set on the activity type; whether API-created activities
+  update last-contacted the same way is undocumented. Check on a test record.
+- **Leads.** Converting a lead deletes the lead record, so match phone numbers fresh each night instead of
+  caching record ids.
+- **Limits.** 180 requests/minute rolling.
 
 ## Dialpad API (optional for v1)
 
-`Authorization: Bearer <key>` against `https://dialpad.com/api/v2`. Useful: `GET /users` and
-`GET /numbers` (admin key) for team numbers, `GET /subscriptions/sms` to see the live subscription
-settings. There is no SMS history endpoint; `POST /stats` with `stat_type: texts, export_type: records`
-is an async CSV export that could cross-check the sheet. Google-synced contacts and group ids cannot be
-fetched, so the API can't fill in missing group members.
+`Authorization: Bearer <key>` against `https://dialpad.com/api/v2` (admin creates it under Admin
+Settings > My Company > Authentication > API Keys). Useful: `GET /users` (`phone_numbers`,
+`forwarding_numbers`) and `GET /numbers` (admin key) for team numbers. `GET /subscriptions/sms` shows the
+subscription settings, but one created through the deprecated v1 API (or by Pabbly) may only be visible
+through the v1 archive endpoints. There is no SMS history endpoint; `POST /stats` with
+`stat_type: texts, export_type: records` is an async CSV export that could cross-check the sheet, but
+Dialpad support has to enable "Text Logs Export" first and it runs per office. Group ids and
+Google-synced contacts cannot be fetched, so the API can't fill in missing group members. Don't PATCH the
+Pabbly-owned subscription (omitted fields reset to defaults); dedupe in code instead.
+
+Check before launch whether Dialpad's native Copper integration is enabled and logs SMS, so notes aren't
+duplicated.
 
 ## Open questions
 

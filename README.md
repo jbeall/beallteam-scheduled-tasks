@@ -58,9 +58,13 @@ This writes `out/formats/` (gitignored, it contains client messages):
 |---|---|
 | `raw_json` | Every webhook delivery exactly as logged, duplicates and request headers included (baseline) |
 | `clean_json` | Deduped messages as JSON: time, sender name, text; reactions and photos marked |
-| `transcript` | Header with date, team members and contacts, then `[1:48 PM] Name: text` lines |
-| `compact` | No times, reactions/photos/emoji-only messages dropped, back-to-back messages from one person merged |
-| `person_focus` | The transcript relabelled around the one contact the note is for (`PAT CLIENT (this contact)`) |
+| `transcript` | Date + 7-day calendar, team members and contacts (silent ones marked), up to 5 earlier messages as context, then `[1:48 PM] Name: text` lines |
+| `compact` | One-line header and calendar, no times, back-to-back messages from one person merged, reactions shortened to `(reacted 👍)` |
+| `person_focus` | The transcript relabelled around the one contact the note is for (`Pat Client (this contact)`, `(Beall Team)`, `(other contact)`) |
+
+All derived formats name the weekday and the coming week's dates (so "Monday" can become
+"Mon Oct 26"), turn RealScout listing links into their address, and point reactions at the message
+they react to instead of repeating it.
 
 Team numbers are excluded from Copper lookups: every Dialpad line in the log, Dialpad users in
 group member lists, and `TEAM_PHONE_NUMBERS` from `.env` (or `--team-number`) for teammates who
@@ -73,21 +77,27 @@ Set the `LLM_*` values in `.env` (examples are in `.env.example`), then:
 ```
 python -m src sms-try-llm --xlsx "Dialpad SMS Log.xlsx"
 python -m src sms-try-llm --xlsx "Dialpad SMS Log.xlsx" --formats transcript,compact,person_focus --prompts note,bullets,json
-python -m src sms-try-llm --xlsx "Dialpad SMS Log.xlsx" --only smith --model qwen3:14b
+python -m src sms-try-llm --xlsx "Dialpad SMS Log.xlsx" --only smith --model qwen3.5:9b
 ```
 
 Each run writes `out/llm/<model>_<time>/results.md` (a summary table, then every conversation
-with each format/prompt's output) and `results.jsonl`.
+with each format/prompt's output) and `results.jsonl`. `person_focus` runs once per contact in the
+conversation, which is what per-person notes would cost, including contacts who sent nothing that
+day.
 
-Prompt styles: `note` (2-4 plain sentences), `bullets` (Summary / Details / Next steps),
-`json` (`log`, `summary`, `next_steps`, `properties`). All of them tell the model to answer
-`NOTHING TO LOG` (or `"log": false`) for spam, automated texts, and conversations that are only
-reactions or pleasantries.
+Prompt styles: `note` (1-4 plain sentences), `bullets` (Summary / Details / Promised follow-ups),
+`json` (`summary`, `promised_follow_ups`, `properties`, `self_identified`, `log`). All of them tell the
+model to write calendar dates, keep hedges ("Josh said he believes..."), copy addresses exactly, never
+guess a name for a bare phone number, never invent next steps, and answer `NOTHING TO LOG` (or
+`"log": false`) only for ads, automated notices, or a lone emoji/thank-you.
 
 Notes:
 
-- Qwen3-family models "think" before answering. `LLM_THINK=false` turns that off; any leftover
-  `<think>` block is stripped from the output.
+- Qwen3-family models (including Qwen3.8) "think" before answering. `LLM_THINK=false` sends
+  `think: false` to Ollama and `reasoning: {"effort": "none"}` to OpenRouter; any leftover `<think>`
+  block is stripped, and an unfinished one counts as no answer.
+- OpenRouter requests send `provider.data_collection: "deny"` (`LLM_DATA_COLLECTION`) so client texts
+  only go to providers that don't store or train on them.
 - Ollama's default context window is small and long prompts are cut off silently. The client sends
   `LLM_NUM_CTX` (default 16384) and flags a result whose prompt filled the window. The `raw_json`
   format for a busy group text can run past 10,000 tokens.

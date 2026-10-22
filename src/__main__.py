@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
                 provider=args.provider,
                 model=args.model,
             )
-    except (SmsParseError, LlmError, FileNotFoundError) as exc:
+    except (SmsParseError, LlmError, OSError) as exc:
         print(exc, file=sys.stderr)
         return 1
     parser.error(f"Unknown command: {args.command}")

@@ -99,6 +99,10 @@ def run(
     ]
     for day in days:
         folder = FORMATS_DIR / day.slug
+        copy = 1
+        while folder.exists():
+            copy += 1
+            folder = FORMATS_DIR / f"{day.slug}-{copy}"
         folder.mkdir()
         sizes = []
         for format_name in FORMAT_NAMES:
@@ -107,7 +111,7 @@ def run(
             sizes.append(f"{estimate_tokens(text):,}")
         contacts = "; ".join(f"{p.name} {p.phone}" for p in day.thread.contacts)
         index.append(
-            f"| {day.day} | [{day.thread.title}]({day.slug}/transcript.txt) | {contacts} | "
+            f"| {day.day} | [{day.thread.title}]({folder.name}/transcript.txt) | {contacts} | "
             f"{len(day.messages)} | {day.thread.skip_reason or ''} | " + " | ".join(sizes) + " |"
         )
     (FORMATS_DIR / "index.md").write_text("\n".join(index) + "\n", encoding="utf-8")

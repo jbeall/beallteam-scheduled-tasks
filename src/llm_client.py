@@ -42,12 +42,16 @@ class LlmConfig:
     num_ctx: int = 16384  # Ollama context window; its small default silently truncates long prompts
     think: bool = False  # Qwen3-family models "think" before answering unless told not to
     timeout: float = 300.0
+    data_collection: str = "deny"  # OpenRouter: only route to providers that don't store/train on prompts
 
     @classmethod
     def from_env(cls, *, provider: str | None = None, model: str | None = None) -> "LlmConfig":
         load_dotenv(ROOT / ".env")
-        provider = (provider or os.getenv("LLM_PROVIDER") or "ollama").strip().lower()
-        base_url = os.getenv("LLM_BASE_URL", "").strip() or DEFAULT_BASE_URLS.get(provider, "")
+        env_provider = (os.getenv("LLM_PROVIDER") or "ollama").strip().lower()
+        provider = (provider or env_provider).strip().lower()
+        # LLM_BASE_URL belongs to LLM_PROVIDER; a --provider override uses that provider's default.
+        base_url = os.getenv("LLM_BASE_URL", "").strip() if provider == env_provider else ""
+        base_url = base_url or DEFAULT_BASE_URLS.get(provider, "")
         model = (model or os.getenv("LLM_MODEL") or "").strip()
         if not base_url:
             raise LlmError(f"Set LLM_BASE_URL for provider {provider!r}.")
@@ -66,6 +70,7 @@ class LlmConfig:
             num_ctx=int(os.getenv("LLM_NUM_CTX", "16384")),
             think=os.getenv("LLM_THINK", "false").strip().lower() in {"1", "true", "yes"},
             timeout=float(os.getenv("LLM_TIMEOUT_SECONDS", "300")),
+            data_collection=os.getenv("LLM_DATA_COLLECTION", "deny").strip().lower() or "deny",
         )
 
 
@@ -80,14 +85,21 @@ class LlmResult:
     warning: str | None = None
 
 
+def estimate_tokens(messages: list[dict[str, str]]) -> int:
+    return sum(len(m["content"]) for m in messages) // 4 + 16 * len(messages)
+
+
 def strip_thinking(text: str) -> tuple[str, int]:
-    """Remove <think>…</think> reasoning that some servers leave in the content."""
+    """Remove <think>…</think> reasoning that some servers leave in the content. An unclosed
+    <think> (output cut off mid-reasoning) is dropped too, leaving no answer."""
     removed = 0
     if "</think>" in text:
         head, _, tail = text.rpartition("</think>")
         removed = len(head) + len("</think>")
         text = tail
     cleaned = _THINK_BLOCK.sub("", text)
+    if "<think>" in cleaned:
+        cleaned = cleaned.split("<think>", 1)[0]
     return cleaned.strip(), removed + len(text) - len(cleaned)
 
 
@@ -127,16 +139,23 @@ class LlmClient:
                 continue
             if response.status_code >= 400:
                 raise LlmError(f"POST {url} failed ({response.status_code}): {response.text[:500]}")
-            return response.json(), elapsed
+            try:
+                return response.json(), elapsed
+            except ValueError:
+                last_error = f"non-JSON response ({response.status_code}): {response.text[:300]}"
+                time.sleep(2**attempt)
         raise LlmError(f"POST {url} failed after retries: {last_error}")
 
     def _ollama(self, messages: list[dict[str, str]], json_output: bool) -> LlmResult:
+        # Native /api/chat, because the OpenAI-compatible endpoint can't set num_ctx. num_ctx stays
+        # fixed across calls: changing it makes Ollama reload the model.
         cfg = self.config
         body: dict[str, Any] = {
             "model": cfg.model,
             "messages": messages,
             "stream": False,
             "think": cfg.think,
+            "keep_alive": "10m",
             "options": {
                 "num_ctx": cfg.num_ctx,
                 "temperature": cfg.temperature,
@@ -156,9 +175,15 @@ class LlmClient:
         message = data.get("message") or {}
         text, stripped = strip_thinking(message.get("content") or "")
         prompt_tokens = data.get("prompt_eval_count")
+        estimate = estimate_tokens(messages)
         warning = None
-        if prompt_tokens and prompt_tokens >= cfg.num_ctx - 16:
-            warning = f"prompt filled the {cfg.num_ctx}-token context window; it was probably truncated"
+        if estimate + cfg.max_tokens > cfg.num_ctx or (prompt_tokens and prompt_tokens >= cfg.num_ctx - 16):
+            warning = (
+                f"prompt (~{estimate} tokens) does not fit the {cfg.num_ctx}-token context window; "
+                "Ollama probably cut it off. Raise LLM_NUM_CTX."
+            )
+        elif data.get("done_reason") == "length":
+            warning = "output hit max_tokens" + ("" if text else " before any answer")
         return LlmResult(
             text=text,
             seconds=seconds,
@@ -180,9 +205,18 @@ class LlmClient:
         if json_output:
             body["response_format"] = {"type": "json_object"}
         if cfg.provider == "openrouter":
-            headers["X-Title"] = "Beall Team SMS notes"
-            body["reasoning"] = {"enabled": cfg.think}
-        data, seconds = self._post(f"{cfg.base_url}/chat/completions", body, headers)
+            body["provider"] = {"data_collection": cfg.data_collection}
+            if not cfg.think:
+                body["reasoning"] = {"effort": "none"}
+        url = f"{cfg.base_url}/chat/completions"
+        try:
+            data, seconds = self._post(url, body, headers)
+        except LlmError as exc:
+            # Models whose reasoning is mandatory reject effort "none"; let them reason, then strip it.
+            if "reasoning" not in body or "reasoning" not in str(exc).lower():
+                raise
+            body.pop("reasoning")
+            data, seconds = self._post(url, body, headers)
         choices = data.get("choices") or []
         if not choices:
             raise LlmError(f"No choices in response: {str(data)[:300]}")

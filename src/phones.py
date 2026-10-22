@@ -19,11 +19,11 @@ def normalize(value: str | None) -> str | None:
     d = digits(raw)
     if not d:
         return None
+    if raw.startswith("+"):
+        return f"+{d}"
     if len(d) == 10:
         return f"+1{d}"
     if len(d) == 11 and d.startswith("1"):
-        return f"+{d}"
-    if raw.startswith("+"):
         return f"+{d}"
     return d
 

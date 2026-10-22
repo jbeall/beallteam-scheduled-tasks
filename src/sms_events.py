@@ -46,8 +46,9 @@ class SmsEvent:
     direction: str  # "inbound" | "outbound"
     from_number: str | None
     to_numbers: tuple[str, ...]
-    text: str
+    text: str  # message text; for MMS, the caption ("" when there is none)
     is_mms: bool
+    mms_url: str | None
     contact_id: str
     contact_type: str  # "local" | "google" | "shortcode" | "contact_group" | ...
     contact_name: str
@@ -57,6 +58,7 @@ class SmsEvent:
     target: Party | None  # the Dialpad line this copy of the event was delivered for
     target_type: str | None
     status: str | None
+    is_internal: bool  # Dialpad flags texts between two users of the same company
     is_slim: bool  # trimmed payload without target/members/status
     source: str
     raw: dict[str, Any]
@@ -94,9 +96,16 @@ def parse_event(payload: dict[str, Any], *, source: str = "") -> SmsEvent:
     except (KeyError, TypeError, ValueError) as exc:
         raise SmsParseError(f"{source}: missing id/created_date/contact") from exc
 
-    text = payload.get("text") or ""
-    mms_url = payload.get("mms_url")
-    is_mms = bool(payload.get("mms")) or bool(mms_url) or text.startswith(MMS_URL_PREFIX)
+    raw_text = payload.get("text") or ""
+    text_content = payload.get("text_content") or ""
+    mms_url = payload.get("mms_url") or (raw_text if raw_text.startswith(MMS_URL_PREFIX) else None)
+    is_mms = bool(payload.get("mms")) or bool(mms_url)
+    if is_mms:
+        # `text` holds the image URL; typed words, if any, are in text_content.
+        captions = [t for t in (text_content, raw_text) if t and not t.startswith(MMS_URL_PREFIX)]
+        text = captions[0] if captions else ""
+    else:
+        text = raw_text or text_content
 
     target_raw = payload.get("target") or None
     target = None
@@ -125,6 +134,7 @@ def parse_event(payload: dict[str, Any], *, source: str = "") -> SmsEvent:
         ),
         text=text,
         is_mms=is_mms,
+        mms_url=mms_url,
         contact_id=str(contact.get("id") or ""),
         contact_type=contact.get("type") or "",
         contact_name=contact.get("name") or "",
@@ -134,6 +144,7 @@ def parse_event(payload: dict[str, Any], *, source: str = "") -> SmsEvent:
         target=target,
         target_type=(target_raw or {}).get("type"),
         status=payload.get("message_status"),
+        is_internal=bool(payload.get("is_internal")),
         is_slim="target" not in payload,
         source=source,
         raw=payload,
