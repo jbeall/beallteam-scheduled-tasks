@@ -72,6 +72,31 @@ The spreadsheet's own time zone is GMT; nothing depends on it.
 - A conversation that crosses midnight Eastern becomes two days, so two notes. Accepted for v1; the second
   day's input shows the first day's last messages as context.
 
+## Google Sheets access
+
+- **Recommended: OAuth "Desktop app" client + Internal consent screen**, in a Google Cloud project created
+  under the beallteam.com organization (not "No organization"). Enable only the Google Sheets API, request
+  only `https://www.googleapis.com/auth/spreadsheets`, and authorize once in a browser on the host
+  (`run_local_server`) as a Workspace user the sheet is shared with (a dedicated automation user is best;
+  Josh works). The refresh token is saved to an ACL-restricted file and used headlessly.
+  Why: new Cloud orgs (since 2024) block service-account key creation by default, and Workspace
+  external-sharing settings can block sharing a sheet with a `*.iam.gserviceaccount.com` address. An
+  Internal app avoids both, needs no Google verification, and isn't subject to the 7-day token expiry of
+  External apps in Testing. If Workspace API controls restrict Sheets, the admin ticks "Trust internal apps".
+- **Fallback: service account** with a JSON key, if an admin overrides the key-creation policy for this one
+  project (undo later with `gcloud org-policies delete <constraint> --project=…`, not `reset`) and allows
+  external sharing for the sheet owner's OU.
+- **Libraries:** google-auth + google-auth-oauthlib, and google-api-python-client or a thin REST wrapper
+  (gspread is unmaintained). These need Python 3.10+.
+- **Reading:** `values.batchGet` with `valueRenderOption=UNFORMATTED_VALUE` (column A is a plain number in
+  Eastern wall time; the payload's `created_date` is used instead). Resolve the sheetIds of exactly
+  `texts` and `processed` at startup and stop if either is missing.
+- **Moving rows** (only after Copper writes succeed): re-read the snapshot range and compare, then one
+  atomic `batchUpdate` of [appendCells to `processed`, deleteDimension on `texts` rows 2..K+1]. Rows Pabbly
+  appends meanwhile land below and survive. Add a spare row first only when the delete would remove every
+  non-frozen row (the API refuses that). Never `values.clear`. Correctness rests on the ledger, not the move.
+- **Growth:** a spreadsheet is capped at 10 million cells; archive `processed` yearly and drop unused columns.
+
 ## Copper
 
 - **Activity type.** No built-in SMS type. An admin creates "Text Message" in Workspace Settings >
