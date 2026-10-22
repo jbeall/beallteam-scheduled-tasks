@@ -1,0 +1,25 @@
+# Secrets
+.env
+*.credentials.json
+google-service-account*.json
+token*.json
+
+# Client / CRM data and run output — do not commit
+out/
+data/
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+*.sqlite
+*.sqlite3
+logs/
+
+# Local Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
